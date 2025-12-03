@@ -1,0 +1,35 @@
+{
+  "name": "quiz-service",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "build": "npm i --output .",
+    "deploy": "set -a; . ./.deploy.env; set +a && rsync -avz --exclude 'node_modules' --exclude '.git' --exclude '.env' -e \"ssh -i $DEPLOY_SSH_KEY\" . $DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH && ssh -i $DEPLOY_SSH_KEY $DEPLOY_USER@$DEPLOY_HOST \"cd $DEPLOY_PATH && $DEPLOY_SETUP_CMD\"",
+    "seed:game-questions": "node scripts/seed-game-questions.js"
+  },
+  "dependencies": {
+    "axios": "^1.13.2",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.3",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.9.3",
+    "morgan": "^1.10.0",
+    "yargs": "^17.7.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.10"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "type": "module"
+}
