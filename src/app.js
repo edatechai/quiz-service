@@ -23,6 +23,10 @@ app.use(express.json());
 app.use(cookieParser());
 app.use(morgan(env.logLevel));
 
+
+app.use("/", (req, res) => {
+	res.json({ message: "Welcome to the Quiz Service" });
+});
 app.use("/health", healthRouter);
 app.use("/api/quizzes", quizRouter);
 app.use("/api/auth", authRouter);
