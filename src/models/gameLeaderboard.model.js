@@ -15,6 +15,12 @@ const GameLeaderboardSchema = new Schema(
 		totalScore: { type: Number, default: 0 },
 		roundsPlayed: { type: Number, default: 0 },
 		lastSubmissionAt: { type: Date, default: Date.now },
+		// Per-round score tracking: { "0": 15.5, "1": 22.0, "2": 18.3 }
+		// Key is round index (as string), value is total score for that round
+		roundScores: {
+			type: Schema.Types.Mixed,
+			default: {},
+		},
 		// GAME-08: Store individual answers for atomicity and duplicate prevention
 		// Key format: "round{N}_q{M}" where N is round index, M is question index
 		// This allows checking if an answer was already submitted before adding score

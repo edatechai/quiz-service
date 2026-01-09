@@ -10,27 +10,35 @@ import authRouter from "./routes/auth.routes.js";
 import gameRouter from "./routes/game.routes.js";
 
 const corsOptions = {
-	origin: env.corsOrigin === "*" ? true : env.corsOrigin,
+	origin: true, // Allow all origins (simpler for development/admin endpoints)
 	credentials: true,
 	methods: ["GET", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
-	allowedHeaders: ["Content-Type", "Authorization"],
+	allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
+	optionsSuccessStatus: 200, // Some legacy browsers choke on 204
 };
 
 const app = express();
 
+// CORS middleware handles preflight automatically
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(cookieParser());
 app.use(morgan(env.logLevel));
 
 
-app.use("/", (req, res) => {
-	res.json({ message: "Welcome to the Quiz Service" });
-});
+
+
 app.use("/health", healthRouter);
-app.use("/api/quizzes", quizRouter);
-app.use("/api/auth", authRouter);
-app.use("/api/game", gameRouter);
+app.use("/quiz/health", healthRouter);
+app.use("/quiz/api/health", healthRouter);
+
+const apiRouter = express.Router();
+apiRouter.use("/quizzes", quizRouter);
+apiRouter.use("/auth", authRouter);
+apiRouter.use("/game", gameRouter);
+
+// Only register /api - nginx rewrites /quiz/api to /api
+app.use("/api", apiRouter);
 
 app.use(notFoundHandler);
 app.use(errorHandler);

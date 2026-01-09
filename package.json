@@ -8,7 +8,8 @@
     "dev": "nodemon src/server.js",
     "build": "npm i --output .",
     "deploy": "set -a; . ./.deploy.env; set +a && rsync -avz --exclude 'node_modules' --exclude '.git' --exclude '.env' -e \"ssh -i $DEPLOY_SSH_KEY\" . $DEPLOY_USER@$DEPLOY_HOST:$DEPLOY_PATH && ssh -i $DEPLOY_SSH_KEY $DEPLOY_USER@$DEPLOY_HOST \"cd $DEPLOY_PATH && $DEPLOY_SETUP_CMD\"",
-    "seed:game-questions": "node scripts/seed-game-questions.js"
+    "seed:game-questions": "node scripts/seed-game-questions.js",
+    "test:start-round5": "node scripts/start_round5.js"
   },
   "dependencies": {
     "axios": "^1.13.2",
@@ -19,6 +20,7 @@
     "jsonwebtoken": "^9.0.2",
     "mongoose": "^8.9.3",
     "morgan": "^1.10.0",
+    "socket.io": "^4.7.4",
     "yargs": "^17.7.2"
   },
   "devDependencies": {

@@ -132,6 +132,12 @@ router.get("/online-users", requireAuth, (req, res) => {
         continue;
       }
 
+      // Skip admin users (with @edatech.ai email) from participant list
+      const isAdmin = user.coordinatorEmail?.endsWith('@edatech.ai') || schoolId === 'admin';
+      if (isAdmin) {
+        continue;
+      }
+
       // Always include AI team, or include regular users if they're within threshold
       if (user.isAITeam || now - user.lastActivity <= ONLINE_THRESHOLD) {
         activeUsers.push({
@@ -142,6 +148,7 @@ router.get("/online-users", requireAuth, (req, res) => {
           lastActivity: user.lastActivity,
           currentScore: user.currentScore ?? 0,
           lastScore: user.lastScore ?? 0,
+          totalScore: user.totalScore ?? 0, // Include total score
           isOnline: true,
           isAITeam: user.isAITeam ?? false, // Include AI team flag
         });

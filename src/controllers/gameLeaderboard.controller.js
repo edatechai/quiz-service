@@ -45,23 +45,34 @@ export const stopQuiz = async (req, res, next) => {
 
 export const submitLeaderboardScore = async (req, res, next) => {
 	try {
+		const currentRoundScore = req.body.roundScore ?? 0;
+		const roundIndex = req.body.roundsPlayed ? req.body.roundsPlayed - 1 : 0; // Current round index (0-based)
+
 		const payload = {
 			schoolId: req.body.schoolId,
 			schoolName: req.body.schoolName,
 			teamName: req.body.teamName,
 			score: req.body.score,
 			roundsPlayed: req.body.roundsPlayed,
-			meta: req.body.meta,
+			meta: {
+				...req.body.meta,
+				roundIndex: roundIndex,
+				pointsEarned: currentRoundScore, // This helps recordScore update roundScores
+			},
 		};
 
 		const result = await gameLeaderboardService.recordScore(payload);
 
+		// Also directly update roundScores in DB for accurate per-round tracking
+		if (currentRoundScore > 0 && req.body.schoolId) {
+			await gameLeaderboardService.updateRoundScore(req.body.schoolId, roundIndex, currentRoundScore);
+		}
+
 		// Update onlineUsers map with round scores and total score for real-time leaderboard
 		if (payload.schoolId) {
 			const existingUser = onlineUsers.get(payload.schoolId);
-			const currentRoundScore = req.body.roundScore ?? 0; // Current round's score
 			const previousRoundScore = req.body.previousRoundScore ?? 0; // Previous round's score
-			
+
 			if (existingUser) {
 				// Update existing user with round scores and cumulative total
 				// Preserve isAITeam flag if it exists
@@ -107,7 +118,7 @@ export const updateLiveScore = async (req, res, next) => {
 
 		// Update onlineUsers map with real-time scores
 		const existingUser = onlineUsers.get(schoolId);
-		
+
 		if (existingUser) {
 			// Update existing user with cumulative total score and round scores
 			// Preserve isAITeam flag if it exists
@@ -148,8 +159,11 @@ export const listLeaderboardScores = async (req, res, next) => {
 		const now = Date.now();
 		const scoreMap = new Map();
 
-		// Add database scores
+		// Add database scores (filter out admin just in case)
 		dbResults.forEach((entry) => {
+			// Skip admin user
+			if (entry.schoolId === 'admin' || entry.schoolName?.toLowerCase() === 'admin') return;
+
 			scoreMap.set(entry.schoolId, {
 				schoolId: entry.schoolId,
 				schoolName: entry.schoolName,
@@ -163,12 +177,15 @@ export const listLeaderboardScores = async (req, res, next) => {
 
 		// Update with real-time onlineUsers scores (if higher or more recent)
 		for (const [schoolId, user] of onlineUsers.entries()) {
+			// Skip admin user
+			if (schoolId === 'admin' || user.schoolId === 'admin') continue;
+
 			// Always include AI team, or include regular users if they're within threshold
 			if (user.isAITeam || now - user.lastActivity <= ONLINE_THRESHOLD) {
 				const existing = scoreMap.get(schoolId);
 				// Use totalScore from onlineUsers if available, otherwise use currentScore
 				const onlineTotalScore = user.totalScore ?? user.currentScore ?? 0;
-				
+
 				// Use online score if it's higher or if there's no database entry
 				if (!existing || onlineTotalScore > (existing.totalScore || 0)) {
 					scoreMap.set(schoolId, {

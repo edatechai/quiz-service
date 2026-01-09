@@ -21,30 +21,55 @@ export const gameQuestionService = {
 			.lean({ virtuals: true });
 	},
 
-	async listByType({ limit = 5, round = null } = {}) {
-		console.log(`[listByType] Called with limit=${limit}, round=${round}`);
+	async listByType({ limit = 5, round = null, excludeIds = [] } = {}) {
+		console.log(`[listByType] Called with limit=${limit}, round=${round}, excludeIds count=${excludeIds.length}`);
+
+		// Helper to filter out excluded questions
+		const filterExcluded = (questions) => {
+			if (!excludeIds || excludeIds.length === 0) return questions;
+			const excludeSet = new Set(excludeIds.map(id => id.toString()));
+			return questions.filter(q => {
+				const qId = q._id?.toString() || q.id?.toString();
+				return !excludeSet.has(qId);
+			});
+		};
+
+		// Round 5 (roundIndex = 4) is Sudden Death - only 1 question
+		if (round === 4) {
+			console.log(`[listByType] Fetching SUDDEN_DEATH question for Round 5`);
+
+			let suddenDeathQuestions = await GameQuestion.find(
+				{ questionType: "SUDDEN_DEATH" },
+				{ prompt: 1, questionType: 1, options: 1, meta: 1, createdAt: 1 }
+			)
+				.lean({ virtuals: true });
+
+			// Filter out already-used questions
+			suddenDeathQuestions = filterExcluded(suddenDeathQuestions);
+			console.log(`[listByType] Found ${suddenDeathQuestions.length} SUDDEN_DEATH questions (after exclusion)`);
+
+			// Return just 1 question for Sudden Death
+			if (suddenDeathQuestions.length > 0) {
+				return [suddenDeathQuestions[0]];
+			}
+
+			// Fallback: if no SUDDEN_DEATH questions exist, return empty
+			return [];
+		}
 
 		// Round 2 (roundIndex = 1) should only have "Inside the Box" questions
 		if (round === 1) {
 			console.log(`[listByType] Fetching INSIDE_THE_BOX questions for Round 2`);
 
-			// First, let's see ALL questions
-			const allQuestions = await GameQuestion.find({}).lean();
-			console.log(`[listByType] Total questions in DB: ${allQuestions.length}`);
-			allQuestions.forEach((q, i) => {
-				console.log(`  ${i + 1}. questionType="${q.questionType}" prompt="${q.prompt.substring(0, 40)}..."`);
-			});
-
-			const insideTheBoxQuestions = await GameQuestion.find(
+			let insideTheBoxQuestions = await GameQuestion.find(
 				{ questionType: "INSIDE_THE_BOX" },
-				{ prompt: 1, questionType: 1, options: 1, createdAt: 1 }
+				{ prompt: 1, questionType: 1, options: 1, meta: 1, createdAt: 1 }
 			)
 				.lean({ virtuals: true });
 
-			console.log(`[listByType] Found ${insideTheBoxQuestions.length} INSIDE_THE_BOX questions`);
-			if (insideTheBoxQuestions.length > 0) {
-				console.log(`[listByType] First question:`, insideTheBoxQuestions[0]);
-			}
+			// Filter out already-used questions
+			insideTheBoxQuestions = filterExcluded(insideTheBoxQuestions);
+			console.log(`[listByType] Found ${insideTheBoxQuestions.length} INSIDE_THE_BOX questions (after exclusion)`);
 
 			// Shuffle and return up to limit
 			const shuffleArray = (array) => {
@@ -64,11 +89,16 @@ export const gameQuestionService = {
 
 		// For other rounds, use the mixed approach
 		// Get all questions grouped by type
-		const allQuestions = await GameQuestion.find(
-			{},
-			{ prompt: 1, questionType: 1, options: 1, createdAt: 1 }
+		// IMPORTANT: Exclude SUDDEN_DEATH questions - they should only appear in Round 5
+		let allQuestions = await GameQuestion.find(
+			{ questionType: { $ne: "SUDDEN_DEATH" } },
+			{ prompt: 1, questionType: 1, options: 1, meta: 1, createdAt: 1 }
 		)
 			.lean({ virtuals: true });
+
+		// Filter out already-used questions
+		allQuestions = filterExcluded(allQuestions);
+		console.log(`[listByType] Total available questions (after exclusion): ${allQuestions.length}`);
 
 		// Group questions by type
 		const questionsByType = new Map();

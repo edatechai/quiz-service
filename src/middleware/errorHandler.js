@@ -1,5 +1,6 @@
 export function notFoundHandler(req, res, next) {
-	res.status(404).json({ message: "Route not found" });
+	console.log(`[404] Route not found: ${req.method} ${req.path}`);
+	res.status(404).json({ success: false, message: "Route not found" });
 }
 
 export function errorHandler(err, req, res, next) {
