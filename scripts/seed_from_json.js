@@ -10,7 +10,7 @@ const __dirname = path.dirname(__filename);
 // Import the GameQuestion model
 import { GameQuestion } from "../src/models/gameQuestion.model.js";
 
-const MONGO_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/edat-quiz";
+const MONGO_URI = process.env.MONGO_URL || "mongodb://localhost:27017/edat-quiz";
 
 async function seedQuestions() {
     try {
@@ -19,7 +19,7 @@ async function seedQuestions() {
         console.log("Connected to MongoDB");
 
         // Read the JSON file
-        const jsonPath = path.resolve(__dirname, "../../quizQuesions.JSON");
+        const jsonPath = path.resolve(__dirname, "../../question_set.JSON");
         const jsonData = JSON.parse(fs.readFileSync(jsonPath, "utf-8"));
 
         console.log(`\nFound ${jsonData.metadata.totalQuestions} questions in JSON file`);
@@ -43,6 +43,7 @@ async function seedQuestions() {
                 // null scores are for inside_the_box questions (no right answer)
                 correctness: opt.score === null ? 0 : (opt.score === 10 ? 3 : (opt.score / 10) * 3),
                 score: opt.score, // Keep original score for 50/50 elimination
+                multiplier: opt.multiplier || 1, // Store multiplier for Sudden Death
             }));
 
             return {

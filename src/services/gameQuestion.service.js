@@ -34,83 +34,7 @@ export const gameQuestionService = {
 			});
 		};
 
-		// Round 5 (roundIndex = 4) is Sudden Death - only 1 question
-		if (round === 4) {
-			console.log(`[listByType] Fetching SUDDEN_DEATH question for Round 5`);
-
-			let suddenDeathQuestions = await GameQuestion.find(
-				{ questionType: "SUDDEN_DEATH" },
-				{ prompt: 1, questionType: 1, options: 1, meta: 1, createdAt: 1 }
-			)
-				.lean({ virtuals: true });
-
-			// Filter out already-used questions
-			suddenDeathQuestions = filterExcluded(suddenDeathQuestions);
-			console.log(`[listByType] Found ${suddenDeathQuestions.length} SUDDEN_DEATH questions (after exclusion)`);
-
-			// Return just 1 question for Sudden Death
-			if (suddenDeathQuestions.length > 0) {
-				return [suddenDeathQuestions[0]];
-			}
-
-			// Fallback: if no SUDDEN_DEATH questions exist, return empty
-			return [];
-		}
-
-		// Round 2 (roundIndex = 1) should only have "Inside the Box" questions
-		if (round === 1) {
-			console.log(`[listByType] Fetching INSIDE_THE_BOX questions for Round 2`);
-
-			let insideTheBoxQuestions = await GameQuestion.find(
-				{ questionType: "INSIDE_THE_BOX" },
-				{ prompt: 1, questionType: 1, options: 1, meta: 1, createdAt: 1 }
-			)
-				.lean({ virtuals: true });
-
-			// Filter out already-used questions
-			insideTheBoxQuestions = filterExcluded(insideTheBoxQuestions);
-			console.log(`[listByType] Found ${insideTheBoxQuestions.length} INSIDE_THE_BOX questions (after exclusion)`);
-
-			// Shuffle and return up to limit
-			const shuffleArray = (array) => {
-				const shuffled = [...array];
-				for (let i = shuffled.length - 1; i > 0; i--) {
-					const j = Math.floor(Math.random() * (i + 1));
-					[shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
-				}
-				return shuffled;
-			};
-
-			const shuffled = shuffleArray(insideTheBoxQuestions);
-			const result = shuffled.slice(0, limit);
-			console.log(`[listByType] Returning ${result.length} questions for Round 2`);
-			return result;
-		}
-
-		// For other rounds, use the mixed approach
-		// Get all questions grouped by type
-		// IMPORTANT: Exclude SUDDEN_DEATH questions - they should only appear in Round 5
-		let allQuestions = await GameQuestion.find(
-			{ questionType: { $ne: "SUDDEN_DEATH" } },
-			{ prompt: 1, questionType: 1, options: 1, meta: 1, createdAt: 1 }
-		)
-			.lean({ virtuals: true });
-
-		// Filter out already-used questions
-		allQuestions = filterExcluded(allQuestions);
-		console.log(`[listByType] Total available questions (after exclusion): ${allQuestions.length}`);
-
-		// Group questions by type
-		const questionsByType = new Map();
-		allQuestions.forEach((question) => {
-			const type = question.questionType || "";
-			if (!questionsByType.has(type)) {
-				questionsByType.set(type, []);
-			}
-			questionsByType.get(type).push(question);
-		});
-
-		// Shuffle questions within each type
+		// Shuffle helper
 		const shuffleArray = (array) => {
 			const shuffled = [...array];
 			for (let i = shuffled.length - 1; i > 0; i--) {
@@ -120,61 +44,41 @@ export const gameQuestionService = {
 			return shuffled;
 		};
 
-		// Shuffle each type's questions
-		for (const [type, questions] of questionsByType.entries()) {
-			questionsByType.set(type, shuffleArray(questions));
-		}
+		// Map round index to question type
+		// Round 1 (0): ACADEMIC
+		// Round 2 (1): OUTSIDE_THE_BOX
+		// Round 3 (2): CURRENT_AFFAIRS
+		// Round 4 (3): INSIDE_THE_BOX
+		// Round 5 (4): SUDDEN_DEATH
+		const roundTypeMap = {
+			0: "ACADEMIC",
+			1: "OUTSIDE_THE_BOX",
+			2: "CURRENT_AFFAIRS",
+			3: "INSIDE_THE_BOX",
+			4: "SUDDEN_DEATH"
+		};
 
-		const selectedQuestions = [];
+		const questionType = roundTypeMap[round] || "ACADEMIC";
+		const questionsLimit = round === 4 ? 1 : limit; // Sudden Death only has 1 question
 
-		// If we have no questions, return empty array
-		if (questionsByType.size === 0) {
-			return [];
-		}
+		console.log(`[listByType] Round ${round !== null ? round + 1 : 'N/A'}: Fetching ${questionType} questions (limit: ${questionsLimit})`);
 
-		// PRIORITY: Always include at least one "Inside the Box" question if available
-		const insideTheBoxQuestions = questionsByType.get("INSIDE_THE_BOX");
-		if (insideTheBoxQuestions && insideTheBoxQuestions.length > 0) {
-			selectedQuestions.push(insideTheBoxQuestions[0]);
-			questionsByType.set("INSIDE_THE_BOX", insideTheBoxQuestions.slice(1));
-		}
+		let questions = await GameQuestion.find(
+			{ questionType: questionType },
+			{ prompt: 1, questionType: 1, options: 1, meta: 1, createdAt: 1 }
+		)
+			.lean({ virtuals: true });
 
-		// Get remaining types (excluding INSIDE_THE_BOX since we already handled it)
-		const types = Array.from(questionsByType.keys()).filter(t => t !== "INSIDE_THE_BOX");
+		// Filter out already-used questions
+		questions = filterExcluded(questions);
+		console.log(`[listByType] Found ${questions.length} ${questionType} questions (after exclusion)`);
 
-		// Fill remaining slots with questions from other types
-		while (selectedQuestions.length < limit) {
-			let found = false;
+		// Shuffle and return up to limit
+		const shuffled = shuffleArray(questions);
+		const result = shuffled.slice(0, questionsLimit);
+		console.log(`[listByType] Returning ${result.length} questions for Round ${round !== null ? round + 1 : 'N/A'}`);
 
-			// Try to get a question from any type
-			for (const type of types) {
-				const questions = questionsByType.get(type);
-				if (questions && questions.length > 0) {
-					selectedQuestions.push(questions[0]);
-					questionsByType.set(type, questions.slice(1));
-					found = true;
-					break;
-				}
-			}
-
-			// If no more questions from other types, try INSIDE_THE_BOX again
-			if (!found) {
-				const insideQuestions = questionsByType.get("INSIDE_THE_BOX");
-				if (insideQuestions && insideQuestions.length > 0) {
-					selectedQuestions.push(insideQuestions[0]);
-					questionsByType.set("INSIDE_THE_BOX", insideQuestions.slice(1));
-					found = true;
-				}
-			}
-
-			// If no more questions available at all, break
-			if (!found) {
-				break;
-			}
-		}
-
-		// Shuffle the final selection to mix types (but INSIDE_THE_BOX will always be included)
-		return shuffleArray(selectedQuestions);
+		return result;
 	},
 
 	async bulkUpsert(questions = []) {

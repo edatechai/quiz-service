@@ -3,6 +3,8 @@ import jwt from "jsonwebtoken";
 import { env } from "../config/env.js";
 import { onlineUsers, ONLINE_THRESHOLD, AI_TEAM_ID, generateSessionId, hasActiveSession, forceLogout } from "../stores/onlineUsers.store.js";
 import { requireAuth } from "../middleware/auth.middleware.js";
+import { markLoggedIn } from "../stores/participationTracker.store.js";
+import { emitQuizEvent, QUIZ_EVENTS } from "../services/socket.service.js";
 
 const router = Router();
 
@@ -15,9 +17,9 @@ router.post("/qr-login", async (req, res) => {
     }
 
     // Basic shape check
-    const { type, schoolId, schoolName, coordinatorEmail, region, iat } = payload;
-    if (type !== "school_login" || !schoolId || !schoolName || !coordinatorEmail) {
-      return res.status(400).json({ message: "Malformed QR payload" });
+    const { type, schoolId, schoolName, region, iat } = payload;
+    if (type !== "school_login" || !schoolId || !schoolName) {
+      return res.status(400).json({ message: "Invalid QR payload" });
     }
 
     // AUTH-06: Check for concurrent login
@@ -46,7 +48,6 @@ router.post("/qr-login", async (req, res) => {
       sub: `school:${schoolId}`,
       sid: schoolId,
       sn: schoolName,
-      em: coordinatorEmail,
       rg: region || null,
       typ: "school",
       ssid: sessionId, // Session ID for concurrent login tracking
@@ -60,7 +61,6 @@ router.post("/qr-login", async (req, res) => {
     onlineUsers.set(schoolId, {
       schoolId,
       schoolName,
-      coordinatorEmail,
       region: region || null,
       lastActivity: Date.now(),
       currentScore: existingUser?.currentScore ?? 0,
@@ -69,6 +69,9 @@ router.post("/qr-login", async (req, res) => {
       sessionId, // Track the session ID for concurrent login detection
       forceLoggedOut: false, // Clear force logout flag on new login
     });
+
+    // Track in participation tracker
+    markLoggedIn(schoolId, schoolName);
 
     // HttpOnly cookie for session
     res.cookie("qsid", token, {
@@ -143,7 +146,6 @@ router.get("/online-users", requireAuth, (req, res) => {
         activeUsers.push({
           schoolId: user.schoolId,
           schoolName: user.schoolName,
-          coordinatorEmail: user.coordinatorEmail,
           region: user.region,
           lastActivity: user.lastActivity,
           currentScore: user.currentScore ?? 0,
@@ -215,7 +217,6 @@ router.get("/admin/online-users", (req, res) => {
         activeUsers.push({
           schoolId: user.schoolId,
           schoolName: user.schoolName,
-          coordinatorEmail: user.coordinatorEmail,
           region: user.region,
           lastActivity: user.lastActivity,
           currentScore: user.currentScore ?? 0,
@@ -265,6 +266,38 @@ router.post("/admin/force-logout/:schoolId", (req, res) => {
   } catch (err) {
     console.error(err);
     return res.status(500).json({ message: "Failed to force logout" });
+  }
+});
+
+// NEW: Force logout ALL teams (Admin)
+router.post("/admin/force-logout-all", (req, res) => {
+  try {
+    let count = 0;
+
+    for (const [schoolId, user] of onlineUsers.entries()) {
+      // Skip admins and AI team
+      const isAdmin = user.coordinatorEmail?.endsWith('@edatech.ai') || schoolId === 'admin';
+      const isAI = schoolId === AI_TEAM_ID;
+
+      if (!isAdmin && !isAI) {
+        forceLogout(schoolId);
+        count++;
+      }
+    }
+
+    // Emit socket event to notify all connected clients immediately
+    emitQuizEvent(QUIZ_EVENTS.FORCE_LOGOUT, {
+      message: "All sessions have been terminated by the Quiz Master",
+      timestamp: Date.now()
+    });
+
+    return res.status(200).json({
+      message: `Successfully logged out ${count} team(s)`,
+      data: { count }
+    });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: "Failed to force logout all teams" });
   }
 });
 

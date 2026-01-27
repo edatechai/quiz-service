@@ -23,7 +23,7 @@ const app = express();
 app.use(cors(corsOptions));
 app.use(express.json());
 app.use(cookieParser());
-app.use(morgan(env.logLevel));
+// app.use(morgan(env.logLevel)); // Disabled to reduce terminal noise
 
 
 

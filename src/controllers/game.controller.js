@@ -1,6 +1,6 @@
 import { gameQuestionService } from "../services/gameQuestion.service.js";
 import { GameQuestion } from "../models/gameQuestion.model.js";
-import { setCurrentQuestion, getCurrentQuizState as getQuizState, startRound as startRoundInStore, resetQuizState, advanceToNextQuestion, getQuestionTimingInfo, setQuestionDuration, setGlobalTimeLimitOverride, quizStateStore, getRoundQuestions, getUsedQuestionIds } from "../stores/quizState.store.js";
+import { setCurrentQuestion, getCurrentQuizState as getQuizState, startRound as startRoundInStore, resetQuizState, advanceToNextQuestion, getQuestionTimingInfo, setQuestionDuration, setGlobalTimeLimitOverride, quizStateStore, getRoundQuestions, getQuestionsForRound, getUsedQuestionIds, recordRoundSubmission, hasSubmittedRound, getAllRoundSubmissions, setRoundQuestions } from "../stores/quizState.store.js";
 import { checkAndAnswerQuestion, resetAITeamAnswers } from "../services/aiTeamQuiz.service.js";
 import { getAIHint } from "../services/aiAssistant.service.js";
 import { publishAnnouncement, getActiveAnnouncements, clearAnnouncementById, clearAllAnnouncements } from "../stores/announcement.store.js";
@@ -16,8 +16,10 @@ const formatOptionsForClient = (options = []) => {
 		text: option.text,
 		correctness: option.correctness ?? 0,
 		score: option.score ?? option.correctness ?? 0, // Original score for 50/50 elimination
+		multiplier: option.multiplier, // Sudden Death multiplier (0.25, 0.5, 1, 2)
 	}));
 };
+
 
 // DEBUG: Check question types in database
 export const debugQuestionTypes = async (req, res, next) => {
@@ -27,10 +29,10 @@ export const debugQuestionTypes = async (req, res, next) => {
 		for (const type of types) {
 			counts[type] = await GameQuestion.countDocuments({ questionType: type });
 		}
-		
+
 		// Check specifically for SUDDEN_DEATH
 		const suddenDeath = await GameQuestion.find({ questionType: 'SUDDEN_DEATH' }).lean();
-		
+
 		res.json({
 			types,
 			counts,
@@ -60,38 +62,40 @@ export const listGameQuestions = async (req, res, next) => {
 		const globalTimeLimitOverride = (settingsObj.globalTimeLimitOverride !== undefined && settingsObj.globalTimeLimitOverride !== null && !isNaN(Number(settingsObj.globalTimeLimitOverride)))
 			? Number(settingsObj.globalTimeLimitOverride)
 			: null;
-		
-		console.log(`[listGameQuestions] Settings loaded - globalTimeLimitOverride: ${globalTimeLimitOverride} (raw: ${settingsObj.globalTimeLimitOverride}, type: ${typeof settingsObj.globalTimeLimitOverride})`);
-		
-		if (globalTimeLimitOverride !== null && globalTimeLimitOverride !== undefined) {
-			console.log(`[listGameQuestions] ✅ Global time limit override is ACTIVE: ${globalTimeLimitOverride} seconds`);
-		} else {
-			console.log(`[listGameQuestions] ❌ No global time limit override (using question's timeLimit)`);
-		}
+
+
 
 		// IMPORTANT: Use stored questions if round is active to ensure all users get the same questions
 		const currentState = getQuizState();
 		let questions;
-		
-		console.log(`[listGameQuestions] 📋 Requested round: ${roundIndex}, Current round: ${currentState.currentRound}, Round started: ${currentState.roundStarted}, Stored questions: ${currentState.roundQuestions?.length || 0}`);
-		
-		if (currentState.roundStarted && 
-			currentState.currentRound === roundIndex && 
-			currentState.roundQuestions && 
+
+		// Priority 1: Check if questions are already in the current active round state
+		if (currentState.roundStarted &&
+			currentState.currentRound === roundIndex &&
+			currentState.roundQuestions &&
 			currentState.roundQuestions.length > 0) {
-			// Use pre-fetched questions from round start - ensures consistency across all users
+			console.log(`[Questions] Serving active round questions for Round ${roundIndex + 1}`);
 			questions = currentState.roundQuestions;
-			console.log(`[listGameQuestions] ✅ Using ${questions.length} pre-stored questions for Round ${roundIndex + 1}`);
-			console.log(`[listGameQuestions] ✅ Question IDs: ${questions.map(q => q._id || q.id).join(', ')}`);
 		} else {
-			// Fallback: fetch fresh questions (only happens if round not started or different round requested)
-			console.log(`[listGameQuestions] ⚠️ FALLBACK: Fetching fresh questions (round mismatch or not started)`);
-			console.log(`[listGameQuestions] ⚠️ Condition check: roundStarted=${currentState.roundStarted}, currentRound=${currentState.currentRound}, requestedRound=${roundIndex}, storedCount=${currentState.roundQuestions?.length}`);
-			questions = await gameQuestionService.listByType({
-				limit: questionsPerRound,
-				round: roundIndex,
-			});
-			console.log(`[listGameQuestions] ⚠️ Fetched ${questions.length} FRESH questions for Round ${roundIndex !== null ? roundIndex + 1 : 'N/A'}`);
+			// Priority 2: Check if we have historical/persisted questions for this specific round
+			const historicalQuestions = getQuestionsForRound(roundIndex);
+			if (historicalQuestions && historicalQuestions.length > 0) {
+				console.log(`[Questions] Serving persisted questions for Round ${roundIndex + 1} from history`);
+				questions = historicalQuestions;
+			} else {
+				// Priority 3: Fallback - fetch fresh questions and LOCK them for this round to ensure consistency
+				console.log(`[Questions] No pre-picked questions for Round ${roundIndex + 1}. Fetching and locking...`);
+				questions = await gameQuestionService.listByType({
+					limit: questionsPerRound,
+					round: roundIndex,
+				});
+
+				// Lock them in history so subsequent requests from other devices get the same set
+				if (roundIndex !== null) {
+					console.log(`[Questions] Locking questions for Round ${roundIndex + 1} to ensure consistency`);
+					setRoundQuestions(roundIndex, questions);
+				}
+			}
 		}
 
 		const payload = questions.map((q) => {
@@ -99,15 +103,11 @@ export const listGameQuestions = async (req, res, next) => {
 			const questionTimeLimit = q.meta?.timeLimit || 60;
 			// Check if override exists and is a valid number
 			const hasOverride = globalTimeLimitOverride !== null && globalTimeLimitOverride !== undefined && !isNaN(Number(globalTimeLimitOverride));
-			const effectiveTimeLimit = hasOverride 
+			const effectiveTimeLimit = hasOverride
 				? Number(globalTimeLimitOverride)
 				: questionTimeLimit;
-			
-			if (hasOverride) {
-				console.log(`[listGameQuestions] ✅ Question ${q.id}: Override applied (${questionTimeLimit}s → ${effectiveTimeLimit}s)`);
-			} else {
-				console.log(`[listGameQuestions] Question ${q.id}: Using question timeLimit (${questionTimeLimit}s)`);
-			}
+
+
 
 			return {
 				id: q.id?.toString?.() || q._id?.toString?.(),
@@ -133,6 +133,13 @@ export const listGameQuestions = async (req, res, next) => {
 				questions: payload,
 			},
 		});
+
+		// Track question received (after response is sent)
+		// Use schoolId from auth session if available
+		const schoolId = req.session?.sid;
+		if (schoolId && roundIndex !== null) {
+			markQuestionReceived(schoolId, roundIndex, 0);
+		}
 	} catch (error) {
 		next(error);
 	}
@@ -142,7 +149,7 @@ export const listGameQuestions = async (req, res, next) => {
 export const getCurrentQuizState = async (req, res, next) => {
 	try {
 		const state = getQuizState();
-		
+
 		// Get settings to check for global time limit override
 		const settings = await getQuizSettings();
 		// Convert to plain object and handle null/undefined properly
@@ -150,14 +157,8 @@ export const getCurrentQuizState = async (req, res, next) => {
 		const globalTimeLimitOverride = (settingsObj.globalTimeLimitOverride !== undefined && settingsObj.globalTimeLimitOverride !== null && !isNaN(Number(settingsObj.globalTimeLimitOverride)))
 			? Number(settingsObj.globalTimeLimitOverride)
 			: null;
-		
-		console.log(`[getCurrentQuizState] Settings loaded - globalTimeLimitOverride: ${globalTimeLimitOverride} (raw: ${settingsObj.globalTimeLimitOverride}, type: ${typeof settingsObj.globalTimeLimitOverride})`);
-		
-		if (globalTimeLimitOverride !== null && globalTimeLimitOverride !== undefined) {
-			console.log(`[getCurrentQuizState] ✅ Global time limit override is ACTIVE: ${globalTimeLimitOverride} seconds`);
-		} else {
-			console.log(`[getCurrentQuizState] ❌ No global time limit override (using question's timeLimit)`);
-		}
+
+
 
 		// Format question for client if exists
 		let formattedQuestion = null;
@@ -166,16 +167,12 @@ export const getCurrentQuizState = async (req, res, next) => {
 			const questionTimeLimit = state.currentQuestion.meta?.timeLimit || Math.floor(state.questionDuration / 1000) || 60;
 			// Check if override exists and is a valid number
 			const hasOverride = globalTimeLimitOverride !== null && globalTimeLimitOverride !== undefined && !isNaN(Number(globalTimeLimitOverride));
-			const effectiveTimeLimit = hasOverride 
+			const effectiveTimeLimit = hasOverride
 				? Number(globalTimeLimitOverride)
 				: questionTimeLimit;
-			
-			if (hasOverride) {
-				console.log(`[getCurrentQuizState] ✅ Question ${state.currentQuestion.id}: Override applied (${questionTimeLimit}s → ${effectiveTimeLimit}s)`);
-			} else {
-				console.log(`[getCurrentQuizState] Question ${state.currentQuestion.id}: Using question timeLimit (${questionTimeLimit}s)`);
-			}
-			
+
+
+
 			formattedQuestion = {
 				id: state.currentQuestion.id?.toString?.() || state.currentQuestion._id?.toString?.(),
 				question: state.currentQuestion.prompt,
@@ -189,7 +186,7 @@ export const getCurrentQuizState = async (req, res, next) => {
 		// Calculate effective question duration (same logic as above)
 		const questionTimeLimit = state.currentQuestion?.meta?.timeLimit || Math.floor(state.questionDuration / 1000) || 60;
 		const hasOverride = globalTimeLimitOverride !== null && globalTimeLimitOverride !== undefined && !isNaN(Number(globalTimeLimitOverride));
-		const effectiveQuestionDuration = hasOverride 
+		const effectiveQuestionDuration = hasOverride
 			? Number(globalTimeLimitOverride)
 			: questionTimeLimit;
 
@@ -295,6 +292,36 @@ export const startRound = async (req, res, next) => {
 			resetAITeamAnswers();
 		}
 
+		// Before starting Round 5 (Sudden Death), calculate all Inside the Box scores from Round 4
+		if (roundIndex === 4) {
+			console.log(`\n========== CALCULATING INSIDE THE BOX SCORES BEFORE ROUND 5 ==========`);
+
+			// Round 4 (index 3) is Inside the Box - process all 5 questions
+			const insideTheBoxRound = 3;
+			const questionsInRound = 5;
+			let totalProcessed = 0;
+
+			for (let qIndex = 0; qIndex < questionsInRound; qIndex++) {
+				try {
+					const result = await gameLeaderboardService.processConsensusScores(insideTheBoxRound, qIndex);
+					totalProcessed += result.processed || 0;
+					console.log(`[Inside the Box] Question ${qIndex + 1}: Processed ${result.processed} answers`);
+				} catch (err) {
+					console.error(`[Inside the Box] Error processing Q${qIndex + 1}:`, err.message);
+				}
+			}
+
+			console.log(`[Inside the Box] Total answers processed: ${totalProcessed}`);
+
+			// Log all team scores before Sudden Death
+			console.log(`\n---------- PRE-SUDDEN DEATH SCORES (End of Round 4) ----------`);
+			const leaderboard = await gameLeaderboardService.list(100);
+			leaderboard.forEach((team, index) => {
+				console.log(`  ${index + 1}. ${team.schoolName || team.schoolId}: ${team.totalScore} points`);
+			});
+			console.log(`==============================================================\n`);
+		}
+
 		// Get updated state for response and WebSocket (after round started)
 		const updatedRoundState = getQuizState();
 
@@ -335,6 +362,10 @@ export const updateCurrentQuizState = async (req, res, next) => {
 			quizStateStore.roundStarted = false;
 			quizStateStore.currentQuestion = null;
 			// Don't reset roundQuestions - keep them for potential review
+
+			// Persist this reset to the database
+			const { syncToDatabase } = await import("../stores/quizState.store.js");
+			await syncToDatabase();
 
 			return res.json({
 				message: "Quiz state reset to inactive",
@@ -378,16 +409,18 @@ export const updateCurrentQuizState = async (req, res, next) => {
 		} else if (questionId) {
 			// Check if we already have questions stored for this round
 			// If so, use the existing questions instead of refetching (which would shuffle again)
-			let questionsToUse = currentState.roundQuestions;
+			let questionsToUse = getQuestionsForRound(roundIndex) || currentState.roundQuestions;
 
-			// Only fetch new questions if we don't have any stored OR if this is initialization
-			if (!questionsToUse || questionsToUse.length === 0 || questionId === 'init') {
-				console.log(`[Question Fetch] Fetching questions for Round ${roundIndex + 1} (roundIndex: ${roundIndex})`);
+			// Only fetch new questions if we don't have any stored
+			if (!questionsToUse || questionsToUse.length === 0) {
+				console.log(`[Question Fetch] Fetching NEW questions for Round ${roundIndex + 1} (roundIndex: ${roundIndex})`);
 				questionsToUse = await gameQuestionService.listByType({
 					limit: 5,
 					round: roundIndex // Pass the round to get round-specific questions
 				});
 				console.log(`[Question Fetch] Got ${questionsToUse.length} questions:`, questionsToUse.map(q => `${q.questionType}: ${q.prompt.substring(0, 30)}...`));
+			} else {
+				console.log(`[Question Fetch] Using existing questions for Round ${roundIndex + 1}`);
 			}
 
 			const question = questionsToUse[questionIndex] || null;
@@ -421,8 +454,8 @@ export const updateCurrentQuizState = async (req, res, next) => {
 				return res.status(400).json({
 					message: `Round ${roundIndex + 1} has not been started yet. Please wait for admin to start the round.`
 				});
+			}
 		}
-	}
 
 		// Get updated state
 		const updatedState = getQuizState();
@@ -448,10 +481,10 @@ export const updateCurrentQuizState = async (req, res, next) => {
 		next(error);
 	}
 };
-
 // Reset quiz state (admin only)
 import { gameLeaderboardService } from "../services/gameLeaderboard.service.js";
-import { onlineUsers } from "../stores/onlineUsers.store.js";
+import { onlineUsers, AI_TEAM_ID } from "../stores/onlineUsers.store.js";
+import { markQuestionReceived, markAnswerSubmitted, resetParticipationTracker, getParticipationStats } from "../stores/participationTracker.store.js";
 
 // ... existing imports ...
 
@@ -459,7 +492,7 @@ import { onlineUsers } from "../stores/onlineUsers.store.js";
 export const resetQuiz = async (req, res, next) => {
 	try {
 		// 1. Reset quiz flow state
-		resetQuizState();
+		await resetQuizState();
 
 		// 2. Reset AI team answers tracking
 		resetAITeamAnswers();
@@ -478,6 +511,9 @@ export const resetQuiz = async (req, res, next) => {
 			});
 		}
 
+		// 5. Reset participation tracker
+		resetParticipationTracker();
+
 		// Emit WebSocket event for real-time sync
 		emitQuizEvent(QUIZ_EVENTS.QUIZ_RESET, {
 			message: "Quiz has been reset by the Quiz Master",
@@ -488,6 +524,76 @@ export const resetQuiz = async (req, res, next) => {
 			data: getQuizState(),
 		});
 	} catch (error) {
+		next(error);
+	}
+};
+
+// NEW: System Wipe (Total Reset + Logout All)
+export const systemWipe = async (req, res, next) => {
+	try {
+		console.log("🔥 [System] EXECUTING TOTAL SYSTEM WIPE...");
+
+		// 1. Reset quiz flow state
+		await resetQuizState();
+
+		// 2. Reset AI team answers tracking
+		resetAITeamAnswers();
+
+		// 3. Clear all leaderboard data from database
+		await gameLeaderboardService.resetLeaderboard();
+
+		// 4. Force logout ALL users and clear in-memory scores
+		let logoutCount = 0;
+		for (const [schoolId, user] of onlineUsers.entries()) {
+			const isAdmin = user.coordinatorEmail?.endsWith('@edatech.ai') || schoolId === 'admin';
+			const isAI = schoolId === AI_TEAM_ID;
+
+			if (!isAdmin && !isAI) {
+				// Mark as force-logged-out in the onlineUsers map
+				onlineUsers.set(schoolId, {
+					...user,
+					sessionId: null,
+					forceLoggedOut: true,
+					currentScore: 0,
+					lastScore: 0,
+					totalScore: 0,
+				});
+				logoutCount++;
+			} else {
+				// For admin/AI, just reset scores
+				onlineUsers.set(schoolId, {
+					...user,
+					currentScore: 0,
+					lastScore: 0,
+					totalScore: 0,
+				});
+			}
+		}
+
+		// 5. Reset participation tracker
+		resetParticipationTracker();
+
+		// 6. Broadcast reset/logout events
+		// Reset event first so app handles state clearing before redirecting
+		emitQuizEvent(QUIZ_EVENTS.QUIZ_RESET, {
+			message: "The entire system has been reset by the Quiz Master.",
+			timestamp: Date.now()
+		});
+
+		emitQuizEvent(QUIZ_EVENTS.FORCE_LOGOUT, {
+			message: "System has been wiped for a new session. Please re-login.",
+			timestamp: Date.now()
+		});
+
+		console.log(`✅ [System] Wipe complete. Logged out ${logoutCount} teams.`);
+
+		res.json({
+			message: "Total system wipe completed successfully",
+			loggedOutCount: logoutCount,
+			data: getQuizState(),
+		});
+	} catch (error) {
+		console.error("❌ [System] System wipe failed:", error);
 		next(error);
 	}
 };
@@ -638,34 +744,129 @@ export const submitAnswer = async (req, res, next) => {
 			calculatedScore = 0;
 			isDeferred = true;
 		} else if (state.currentQuestion.questionType === "SUDDEN_DEATH") {
-			// Sudden Death scoring formula: multiplier × (remainingTime/totalTime) × currentTotalScore
-			// Multiplier based on option: A=0, B=1, C=2, D=0.5
-			const multiplierMap = { A: 0, B: 1, C: 2, D: 0.5 };
-			const optionLetter = selectedOptionId?.toUpperCase() || "";
-			const multiplier = multiplierMap[optionLetter] ?? 0;
-			
-			// Get user's current total score from the database
+			// Sudden Death scoring formula: finalTotal = preRound5Total × multiplier
+			// The total from Rounds 1-4 is multiplied by the option's multiplier
+
+			// Fetch fresh question data using RAW MongoDB driver (bypassing Mongoose model)
+			// Mongoose was stripping the multiplier field even with .lean()
+			let options = state.currentQuestion.options || [];
+			try {
+				const mongoose = (await import("mongoose")).default;
+				const db = mongoose.connection.db;
+				console.log(`🔍 Querying MongoDB for SUDDEN_DEATH question...`);
+				console.log(`🔍 Database name: ${db.databaseName}`);
+				const rawQuestion = await db.collection("gamequestions").findOne({ questionType: "SUDDEN_DEATH" });
+
+				if (rawQuestion) {
+					console.log(`✅ Found question in database`);
+					console.log(`📥 Full raw question (first 500 chars):`, JSON.stringify(rawQuestion).substring(0, 500));
+
+					if (rawQuestion.options) {
+						options = rawQuestion.options;
+						console.log(`🔄 Loaded RAW Sudden Death options from MongoDB`);
+						console.log(`📥 Raw options data:`, JSON.stringify(options, null, 2));
+
+						// Verify multipliers are present
+						const hasMultipliers = options.every(opt => opt.multiplier !== undefined);
+						if (!hasMultipliers) {
+							console.error(`❌ ERROR: Some options are missing multiplier field!`);
+							options.forEach((opt, i) => {
+								console.error(`   Option ${i}: text="${opt.text}", multiplier=${opt.multiplier}, score=${opt.score}`);
+							});
+
+							// Auto-fix: Update the question with correct multipliers
+							console.log(`🔧 Auto-fixing: Updating multipliers in database...`);
+							const correctOptions = [
+								{ text: "None of the above", correctness: 0, score: 0.25, multiplier: 0.25 },
+								{ text: "30", correctness: 3, score: 1, multiplier: 1 },
+								{ text: "15", correctness: 6, score: 2, multiplier: 2 },
+								{ text: "200 plus", correctness: 1.5, score: 0.5, multiplier: 0.5 }
+							];
+
+							try {
+								await db.collection("gamequestions").updateOne(
+									{ questionType: "SUDDEN_DEATH" },
+									{ $set: { options: correctOptions } }
+								);
+								console.log(`✅ Successfully updated multipliers in database!`);
+								options = correctOptions; // Use the corrected options
+							} catch (updateError) {
+								console.error(`❌ Failed to update multipliers:`, updateError.message);
+							}
+						} else {
+							console.log(`✅ All options have multiplier fields`);
+						}
+					} else {
+						console.warn(`⚠️ No options found in raw question`);
+					}
+				} else {
+					console.error(`❌ No SUDDEN_DEATH question found in database!`);
+				}
+			} catch (e) {
+				console.error("❌ Error fetching raw Sudden Death question:", e.message);
+				console.error(e);
+			}
+
+			const labels = ["A", "B", "C", "D", "E", "F"];
+
+			// Debug: Log what we're looking for and what options we have
+			console.log(`🔍 Looking for option: "${selectedOptionId}"`);
+			console.log(`📋 Available options:`, options.map((o, i) => `${labels[i]}="${o.text}" (mult=${o.multiplier})`).join(', '));
+
+			// Find the selected option by label (A, B, C, D)
+			let selectedOptionData = null;
+			for (let i = 0; i < options.length; i++) {
+				const optionLabel = labels[i];
+				// Match by label (A, B, C, D) - this is what the mobile sends
+				if (optionLabel === selectedOptionId) {
+					selectedOptionData = options[i];
+					console.log(`✅ Found option ${optionLabel}: text="${selectedOptionData.text}", multiplier=${selectedOptionData.multiplier}`);
+					break;
+				}
+			}
+
+			if (!selectedOptionData) {
+				console.warn(`⚠️ Option "${selectedOptionId}" not found in options array!`);
+			}
+
+			// Get multiplier from option data, default to 0.25 if not found (unanswered penalty)
+			const multiplier = selectedOptionData?.multiplier ?? selectedOptionData?.score ?? 0.25;
+			console.log(`🎯 Final multiplier value: ${multiplier}`);
+
+			// Get user's current total score (from Rounds 1-4)
 			const existingUserScore = onlineUsers.get(schoolId);
-			const currentTotalScore = existingUserScore?.totalScore || 0;
-			
+			let preRound5Total = existingUserScore?.totalScore || 0;
+
 			// If no existing score in memory, try to get from DB
-			let userCurrentScore = currentTotalScore;
-			if (userCurrentScore === 0) {
+			if (preRound5Total === 0) {
 				try {
 					const dbEntry = await gameLeaderboardService.getBySchoolId(schoolId);
-					userCurrentScore = dbEntry?.totalScore || 0;
+					preRound5Total = dbEntry?.totalScore || 0;
 				} catch (e) {
 					console.warn("Could not fetch user score from DB for Sudden Death:", e.message);
 				}
 			}
-			
-			const timeRatio = allocatedTime > 0 ? remainingTime / allocatedTime : 0;
-			calculatedScore = Math.round(multiplier * timeRatio * userCurrentScore * 100) / 100;
-			
-			console.log(`🎯 Sudden Death scoring: ${multiplier} × (${remainingTime}/${allocatedTime}) × ${userCurrentScore} = ${calculatedScore}`);
+
+			// NEW FORMULA: finalTotal = preRound5Total × multiplier
+			// Example with 600 points from Rounds 1-4:
+			// - If multiplier = 2: finalTotal = 600 × 2 = 1200
+			// - If multiplier = 1: finalTotal = 600 × 1 = 600
+			// - If multiplier = 0.5: finalTotal = 600 × 0.5 = 300
+			// - If multiplier = 0: finalTotal = 600 × 0 = 0
+			const finalTotal = Math.round(preRound5Total * multiplier * 100) / 100;
+
+			// Calculate the delta needed to achieve this final total
+			calculatedScore = finalTotal - preRound5Total;
+
+			console.log(`🎲 Sudden Death: Selected ${selectedOptionId}, multiplier = ${multiplier}`);
+			console.log(`🎯 Sudden Death scoring: ${preRound5Total} × ${multiplier} = ${finalTotal} (delta: ${calculatedScore >= 0 ? '+' : ''}${calculatedScore})`);
 		} else {
-			// Academic scoring formula: correctness × remaining_time
-			calculatedScore = Math.round(correctnessScore * remainingTime * 10) / 10; // Round to 1 decimal
+			// Academic scoring formula: originalScore × remaining_time
+			// Convert correctness back to original JSON score (1-10 scale)
+			// DB stores: correctness = score/10 * 3, so originalScore = correctness * 10/3
+			const originalScore = Math.round(rawCorrectness * 10 / 3);
+			calculatedScore = Math.round(originalScore * remainingTime * 10) / 10; // Round to 1 decimal
+			console.log(`📊 Academic scoring: originalScore=${originalScore} (from correctness=${rawCorrectness}) × ${remainingTime}s = ${calculatedScore}`);
 		}
 
 		// GAME-08: Use atomic increment for database update
@@ -711,6 +912,22 @@ export const submitAnswer = async (req, res, next) => {
 			lastActivity: Date.now(),
 		});
 
+		// Track answer submitted in participation tracker
+		markAnswerSubmitted(schoolId, state.currentRound, state.currentQuestionIndex);
+
+		// Log final score summary after Round 5 (Sudden Death)
+		if (state.currentRound === 4) {
+			console.log(`\n========== FINAL SCORE AFTER ROUND 5 (SUDDEN DEATH) ==========`);
+			console.log(`School: ${schoolName || schoolId}`);
+			console.log(`Pre-Sudden Death Score: ${existingUser?.totalScore || 0}`);
+			console.log(`Sudden Death Calculation:`);
+			console.log(`  - Selected Option: ${selectedOptionId}`);
+			console.log(`  - Score Delta: ${calculatedScore >= 0 ? '+' : ''}${calculatedScore}`);
+			console.log(`  - Formula: Pre-Score × (multiplier - 1) = Delta`);
+			console.log(`FINAL CUMULATIVE SCORE: ${totalScore}`);
+			console.log(`===============================================================\n`);
+		}
+
 		res.json({
 			message: "Answer submitted successfully",
 			data: {
@@ -727,6 +944,206 @@ export const submitAnswer = async (req, res, next) => {
 			},
 		});
 	} catch (error) {
+		next(error);
+	}
+};
+
+// Batch submit all answers for a round
+export const submitRound = async (req, res, next) => {
+	try {
+		const { schoolId, schoolName, roundIndex, answers } = req.body;
+
+		// Validate input
+		if (!schoolId || roundIndex === undefined || !Array.isArray(answers)) {
+			return res.status(400).json({
+				message: "Missing required fields: schoolId, roundIndex, and answers array"
+			});
+		}
+
+		const state = getQuizState();
+
+		// Verify round matches current active round
+		if (state.currentRound !== roundIndex) {
+			return res.status(400).json({
+				message: `Round mismatch: expected round ${state.currentRound}, got ${roundIndex}`
+			});
+		}
+
+		// Check if already submitted
+		if (hasSubmittedRound(schoolId)) {
+			return res.status(409).json({
+				message: "Already submitted answers for this round"
+			});
+		}
+
+		// Get questions for scoring verification
+		const roundQuestions = getRoundQuestions();
+
+		// Calculate scores for each answer
+		let roundTotalScore = 0;
+		const scoredAnswers = [];
+
+		for (const answer of answers) {
+			const { questionIndex, selectedOptionId, remainingTime, localScore } = answer;
+			const question = roundQuestions[questionIndex];
+
+			if (!question) {
+				continue; // Skip invalid question index
+			}
+
+			// Find the selected option
+			const options = question.options || [];
+			const labels = ["A", "B", "C", "D", "E", "F"];
+			let selectedOption = null;
+			for (let i = 0; i < options.length; i++) {
+				if (labels[i] === selectedOptionId) {
+					selectedOption = options[i];
+					break;
+				}
+			}
+
+			if (!selectedOption) {
+				continue; // Skip invalid option
+			}
+
+			let calculatedScore = 0;
+
+			if (question.questionType === "INSIDE_THE_BOX") {
+				// Deferred scoring - handled separately
+				calculatedScore = 0;
+			} else if (question.questionType === "SUDDEN_DEATH") {
+				// Get existing user total - IMPORTANT: Check DB first since onlineUsers may be empty after server restart
+				const existingUser = onlineUsers.get(schoolId);
+				let preRound5Total = existingUser?.totalScore || 0;
+
+				// If not in memory (server restart), fetch from database
+				if (preRound5Total === 0) {
+					try {
+						const dbEntry = await gameLeaderboardService.getBySchoolId(schoolId);
+						preRound5Total = dbEntry?.totalScore || 0;
+						console.log(`[Sudden Death] Fetched preRound5Total from DB: ${preRound5Total}`);
+					} catch (e) {
+						console.warn(`[Sudden Death] Could not fetch user score from DB: ${e.message}`);
+					}
+				}
+
+				// Default to 0.25 if no option selected (unanswered penalty)
+				const multiplier = selectedOption?.multiplier ?? selectedOption?.score ?? 0.25;
+				const finalTotal = Math.round(preRound5Total * multiplier * 100) / 100;
+				calculatedScore = finalTotal - preRound5Total;
+				console.log(`[Sudden Death Calc] preRound5Total=${preRound5Total}, multiplier=${multiplier}, finalTotal=${finalTotal}, delta=${calculatedScore}`);
+			} else {
+				// Rounds 1-3 scoring: score × remainingTime
+				const optionScore = Number(selectedOption.score ?? selectedOption.correctness ?? 0);
+				calculatedScore = Math.round(optionScore * remainingTime * 10) / 10;
+			}
+
+			roundTotalScore += calculatedScore;
+			scoredAnswers.push({
+				questionIndex,
+				selectedOptionId,
+				remainingTime,
+				localScore,
+				calculatedScore,
+				verified: Math.abs(localScore - calculatedScore) < 1, // Allow small float differences
+			});
+		}
+
+		// Record the submission to tracking store
+		recordRoundSubmission(schoolId, scoredAnswers);
+
+		// Fetch persistent user data from DB to get accurate previous total
+		// (onlineUsers in-memory store might be reset on server restart)
+		const dbUser = await gameLeaderboardService.getBySchoolId(schoolId);
+		const previousTotalScore = dbUser?.totalScore || onlineUsers.get(schoolId)?.totalScore || 0;
+
+		// Get the question type from the first answer to check if this is Sudden Death
+		const firstQuestion = roundQuestions[0];
+		const isSuddenDeathRound = firstQuestion?.questionType === "SUDDEN_DEATH";
+
+		let newTotalScore;
+		if (isSuddenDeathRound) {
+			// For Sudden Death: final score = previousTotal × multiplier (not previousTotal + delta)
+			// The multiplier was already applied in the loop, so finalTotal = previousTotal + roundTotalScore
+			// But we want: finalTotal = previousTotal × multiplier
+			// So we need to recalculate: finalTotal = previousTotal + roundTotalScore gives us the correct value
+			// because roundTotalScore = (previousTotal × multiplier) - previousTotal
+			newTotalScore = previousTotalScore + roundTotalScore;
+			console.log(`[Sudden Death] previousTotal=${previousTotalScore}, delta=${roundTotalScore}, newTotal=${newTotalScore}`);
+		} else {
+			newTotalScore = previousTotalScore + roundTotalScore;
+		}
+
+		// Update user scores in onlineUsers (memory)
+		const existingUser = onlineUsers.get(schoolId);
+		onlineUsers.set(schoolId, {
+			...(existingUser || {}),
+			schoolId,
+			schoolName: schoolName || existingUser?.schoolName || dbUser?.schoolName || "Unknown",
+			currentScore: roundTotalScore,
+			lastScore: previousTotalScore, // Score before this round was submitted (Last Round)
+			totalScore: newTotalScore,
+			lastActivity: Date.now(),
+		});
+
+		// Save to leaderboard database using recordScore
+		// We pass newTotalScore as the 'score' because recordScore sets 'totalScore' to this value
+		await gameLeaderboardService.recordScore({
+			schoolId,
+			schoolName: schoolName || existingUser?.schoolName || dbUser?.schoolName,
+			score: newTotalScore, // Pass accumulated total score
+			meta: {
+				roundIndex,
+				batchSubmission: true,
+				roundScore: roundTotalScore, // Store round score in meta
+				submittedAt: new Date().toISOString(),
+			},
+		});
+
+		// Also update the round specific score atomically
+		await gameLeaderboardService.updateRoundScore(schoolId, roundIndex, roundTotalScore);
+
+		// CRITICAL: For Inside the Box (Round 4), store answers in DB for deferred consensus scoring
+		// processConsensusScores expects answers in format: answers.round{roundIndex}_q{questionIndex}
+		const isInsideTheBoxRound = firstQuestion?.questionType === "INSIDE_THE_BOX";
+		if (isInsideTheBoxRound) {
+			console.log(`[Inside the Box] Storing ${scoredAnswers.length} answers for deferred consensus scoring...`);
+			const { GameLeaderboard } = await import("../models/gameLeaderboard.model.js");
+
+			const answerUpdates = {};
+			for (const scored of scoredAnswers) {
+				const answerKey = `answers.round${roundIndex}_q${scored.questionIndex}`;
+				answerUpdates[answerKey] = {
+					selectedOption: scored.selectedOptionId,
+					remainingTime: scored.remainingTime,
+					optionScore: 10, // Default base score for consensus calculation
+					submittedAt: new Date(),
+					// Note: calculatedScore and processedAt will be set by processConsensusScores
+				};
+			}
+
+			await GameLeaderboard.findOneAndUpdate(
+				{ schoolId },
+				{ $set: answerUpdates },
+				{ upsert: false }
+			);
+			console.log(`[Inside the Box] Stored ${Object.keys(answerUpdates).length} answers for ${schoolId}`);
+		}
+
+		console.log(`[Batch Submit] ${schoolId} submitted round ${roundIndex + 1}: ${scoredAnswers.length} answers, round score: ${roundTotalScore}, new total: ${newTotalScore}`);
+
+		res.json({
+			message: "Round answers submitted successfully",
+			data: {
+				roundIndex,
+				answerCount: scoredAnswers.length,
+				roundScore: roundTotalScore,
+				totalScore: newTotalScore,
+				scoredAnswers,
+			},
+		});
+	} catch (error) {
+		console.error(`[Batch Scoring] Error:`, error);
 		next(error);
 	}
 };
@@ -808,6 +1225,22 @@ export const getRoundSummary = async (req, res, next) => {
 		}
 
 		console.log(`[Summary] Generating summary for Round ${Number(roundIndex) + 1}`);
+
+		// If requesting Round 4 (Inside the Box) summary, calculate deferred scores first
+		// This ensures scores are calculated before showing the round summary modal
+		if (Number(roundIndex) === 3) {
+			console.log(`[Summary] Processing Inside the Box deferred scores for Round 4...`);
+			let totalProcessed = 0;
+			for (let qIndex = 0; qIndex < 5; qIndex++) {
+				try {
+					const result = await gameLeaderboardService.processConsensusScores(3, qIndex);
+					totalProcessed += result.processed || 0;
+				} catch (err) {
+					console.error(`[Summary] Error processing R4 Q${qIndex + 1}:`, err.message);
+				}
+			}
+			console.log(`[Summary] Inside the Box: Processed ${totalProcessed} answers`);
+		}
 
 		const summary = await gameLeaderboardService.getRoundSummary(Number(roundIndex));
 
@@ -1059,6 +1492,81 @@ export const uploadQuestions = async (req, res, next) => {
 		});
 	} catch (error) {
 		console.error("[Questions] Error uploading questions:", error);
+		next(error);
+	}
+};
+
+// Get participation stats (admin only)
+export const getParticipationStatsEndpoint = async (req, res, next) => {
+	try {
+		const state = getQuizState();
+		const stats = getParticipationStats(
+			state.currentRound,
+			state.currentQuestionIndex
+		);
+
+		res.json({
+			message: "Participation stats retrieved successfully",
+			data: stats,
+		});
+	} catch (error) {
+		next(error);
+	}
+};
+
+// Get submission status for all teams (admin only)
+export const getSubmissionStatus = async (req, res, next) => {
+	try {
+		const state = getQuizState();
+		const submissions = getAllRoundSubmissions();
+		const onlineUsers = await import("../stores/onlineUsers.store.js").then(m => m.onlineUsers);
+
+		// Support filtering by specific round (query param, defaults to current round)
+		const roundParam = req.query.round;
+		const targetRound = roundParam !== undefined ? parseInt(roundParam, 10) : state.currentRound;
+
+		// Get all online users and their submission status for the target round
+		const users = [];
+		for (const [schoolId, userData] of onlineUsers.entries()) {
+			// Skip AI team and admin users
+			if (userData.isAITeam) continue;
+			if (schoolId.toLowerCase().includes('admin') ||
+				schoolId.toLowerCase().includes('quizmaster') ||
+				userData.schoolName?.toLowerCase().includes('admin') ||
+				userData.schoolName?.toLowerCase().includes('quiz master')) continue;
+
+			const submission = submissions.find(s => s.schoolId === schoolId && s.round === targetRound);
+			users.push({
+				schoolId,
+				schoolName: userData.schoolName || schoolId,
+				region: userData.region || null,
+				totalScore: userData.totalScore || 0,
+				hasSubmitted: !!submission,
+				submittedAt: submission?.submittedAt || null,
+				answerCount: submission?.answers?.length || 0,
+			});
+		}
+
+		// Sort: submitted first, then by school name
+		users.sort((a, b) => {
+			if (a.hasSubmitted !== b.hasSubmitted) {
+				return a.hasSubmitted ? -1 : 1;
+			}
+			return a.schoolName.localeCompare(b.schoolName);
+		});
+
+		res.json({
+			message: "Submission status retrieved successfully",
+			data: {
+				currentRound: state.currentRound,
+				viewingRound: targetRound,
+				roundStarted: state.roundStarted,
+				submittedCount: users.filter(u => u.hasSubmitted).length,
+				totalUsers: users.length,
+				users,
+			},
+		});
+	} catch (error) {
 		next(error);
 	}
 };

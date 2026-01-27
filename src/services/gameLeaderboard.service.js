@@ -1,6 +1,6 @@
 import { GameLeaderboard } from "../models/gameLeaderboard.model.js";
 import { onlineUsers, ONLINE_THRESHOLD } from "../stores/onlineUsers.store.js";
-import { getCurrentQuizState } from "../stores/quizState.store.js";
+import { getCurrentQuizState, getQuestionsForRound } from "../stores/quizState.store.js";
 
 const sanitizeScorePayload = (payload = {}) => {
 	const errors = [];
@@ -240,39 +240,52 @@ export const gameLeaderboardService = {
 	/**
 	 * Process consensus scores for "Inside the Box" questions
 	 * Score = Time Remaining * Proportion of Teams Selecting Chosen Option
+	 * IMPORTANT: Only processes answers that haven't been processed yet (idempotent)
 	 */
 	async processConsensusScores(round, questionIndex) {
 		const answerKey = `answers.round${round}_q${questionIndex}`;
+		const processedAtKey = `${answerKey}.processedAt`;
 
-		// 1. Get all answers for this question
+		// 1. Get all answers for this question that HAVE NOT been processed yet
 		const submissions = await GameLeaderboard.find({
+			[answerKey]: { $exists: true },
+			[processedAtKey]: { $exists: false }  // Only unprocessed answers
+		}).select(`schoolId ${answerKey}`).lean();
+
+		if (!submissions.length) {
+			console.log(`[Consensus] Round ${round} Q${questionIndex}: No unprocessed answers found (already processed or none submitted)`);
+			return { processed: 0, alreadyProcessed: true };
+		}
+
+		// 2. For consensus calculation, we need ALL submissions (including already processed)
+		// to get accurate proportion calculation
+		const allSubmissions = await GameLeaderboard.find({
 			[answerKey]: { $exists: true }
 		}).select(`schoolId ${answerKey}`).lean();
 
-		if (!submissions.length) return { processed: 0 };
-
-		// 2. Calculate consensus
-		const totalAnswers = submissions.length;
+		const totalAnswers = allSubmissions.length;
 		const optionCounts = {};
 
-		submissions.forEach(sub => {
+		allSubmissions.forEach(sub => {
 			const answer = sub.answers[`round${round}_q${questionIndex}`];
 			const optionId = answer.selectedOption;
 			optionCounts[optionId] = (optionCounts[optionId] || 0) + 1;
 		});
 
-		// 3. Calculate scores for each team and prepare updates
-		const scoreUpdates = []; // Track scores to update in-memory store
+		// 3. Calculate scores ONLY for unprocessed submissions
+		const scoreUpdates = [];
 		const updates = submissions.map(sub => {
 			const answer = sub.answers[`round${round}_q${questionIndex}`];
 			const optionId = answer.selectedOption;
 			const count = optionCounts[optionId] || 0;
 			const proportion = count / totalAnswers;
 
-			// Formula: Score = Time Remaining * Proportion
-			// answer.remainingTime is in seconds (e.g., 15)
-			// proportion is 0.0 to 1.0
-			const calculatedScore = Math.round(answer.remainingTime * proportion * 10) / 10;
+			// Formula: Score = baseScore × Proportion × TimeRemaining
+			// Inside the Box questions don't have option scores (null), so use default of 10
+			const baseScore = answer.optionScore || 10;
+			const calculatedScore = Math.round(baseScore * proportion * answer.remainingTime * 10) / 10;
+
+			console.log(`📦 Inside the Box scoring: ${baseScore} × ${(proportion * 100).toFixed(1)}% × ${answer.remainingTime}s = ${calculatedScore}`);
 
 			// Track for in-memory update
 			scoreUpdates.push({ schoolId: sub.schoolId, calculatedScore });
@@ -281,7 +294,10 @@ export const gameLeaderboardService = {
 				updateOne: {
 					filter: { schoolId: sub.schoolId },
 					update: {
-						$inc: { totalScore: calculatedScore },
+						$inc: {
+							totalScore: calculatedScore,
+							[`roundScores.${round}`]: calculatedScore // Also update round-specific score
+						},
 						$set: {
 							[`${answerKey}.consensusProportion`]: proportion,
 							[`${answerKey}.calculatedScore`]: calculatedScore,
@@ -396,6 +412,61 @@ export const gameLeaderboardService = {
 					}
 				}
 
+				// Filter answers for this round to include in summary (for consensus % display)
+				// RELIABILITY FIX: Ensure ALL questions for the round are included in the summary
+				const roundQuestions = getQuestionsForRound(roundIndex);
+				const roundAnswers = [];
+
+				if (roundQuestions && roundQuestions.length > 0) {
+					// Iterate through every question that was assigned to this round
+					roundQuestions.forEach((q, idx) => {
+						const qKey = `round${roundIndex}_q${idx}`;
+						const submittedAnswer = team.answers ? team.answers[qKey] : null;
+
+						if (submittedAnswer) {
+							// Question was answered
+							const ans = {
+								questionIndex: idx,
+								question: q.prompt || q.question || "",
+								options: q.options || [],
+								...submittedAnswer
+							};
+							roundAnswers.push(ans);
+						} else {
+							// Question was missed - provide placeholder
+							roundAnswers.push({
+								questionIndex: idx,
+								question: q.prompt || q.question || "",
+								options: q.options || [],
+								selectedOptionId: "Missed",
+								localScore: 0,
+								remainingTime: 0,
+								calculatedScore: 0,
+								isMissed: true
+							});
+						}
+					});
+				} else if (team.answers) {
+					// Fallback for legacy data without questionsByRound history
+					for (const [key, answer] of Object.entries(team.answers)) {
+						if (key.startsWith(`round${roundIndex}_q`)) {
+							const qIdx = parseInt(key.split('_q')[1], 10);
+							roundAnswers.push({
+								questionIndex: qIdx,
+								...answer
+							});
+						}
+					}
+					// Sort by index
+					roundAnswers.sort((a, b) => a.questionIndex - b.questionIndex);
+				}
+
+				// Create a map (object) for easy lookup by key
+				const answersMap = {};
+				roundAnswers.forEach(a => {
+					answersMap[`round${roundIndex}_q${a.questionIndex}`] = a;
+				});
+
 				teamScores.push({
 					schoolId: team.schoolId,
 					schoolName: team.schoolName,
@@ -403,7 +474,9 @@ export const gameLeaderboardService = {
 					roundScore: Math.round(effectiveRoundScore * 10) / 10,
 					totalScore: team.totalScore, // Cumulative score
 					questionsAnswered,
-					lastSubmissionTime
+					lastSubmissionTime,
+					answers: roundAnswers, // Keep array for compatibility
+					answersMap: answersMap // Add map for robust sync
 				});
 			}
 		}
@@ -447,7 +520,8 @@ export const gameLeaderboardService = {
 						roundScore: onlineRoundScore,
 						totalScore: onlineTotalScore,
 						questionsAnswered: 0, // Unknown from memory store
-						lastSubmissionTime: user.lastActivity || Date.now()
+						lastSubmissionTime: user.lastActivity || Date.now(),
+						answers: [] // Empty array for consistency
 					});
 				}
 			}

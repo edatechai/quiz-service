@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { debugQuestionTypes, listGameQuestions, uploadQuestions, getCurrentQuizState, updateCurrentQuizState, startRound, resetQuiz, getQuestionHint, submitAnswer, postAnnouncement, getAnnouncement, deleteAnnouncement, getRoundSummary, finalizeRound, getFinalStandings, getSettings, updateSettings } from "../controllers/game.controller.js";
+import { debugQuestionTypes, listGameQuestions, uploadQuestions, getCurrentQuizState, updateCurrentQuizState, startRound, resetQuiz, systemWipe, getQuestionHint, submitAnswer, submitRound, postAnnouncement, getAnnouncement, deleteAnnouncement, getRoundSummary, finalizeRound, getFinalStandings, getSettings, updateSettings, getParticipationStatsEndpoint, getSubmissionStatus } from "../controllers/game.controller.js";
 import {
 	listLeaderboardScores,
 	submitLeaderboardScore,
@@ -25,8 +25,10 @@ router.get("/quiz-state", getCurrentQuizState);
 router.post("/quiz-state", updateCurrentQuizState); // Admin endpoint - no auth for consistency with startRound/reset
 router.post("/round/start", startRound); // Admin endpoint - no auth required for now, can add admin auth later
 router.post("/reset", resetQuiz); // Admin endpoint to reset all quiz state
+router.post("/system-wipe", systemWipe); // Admin endpoint for total system reset (reset state + logout all)
 router.get("/hint", requireAuth, getQuestionHint); // Get AI hint for current question
-router.post("/answer", requireAuth, submitAnswer); // Submit answer with time-based scoring
+router.post("/answer", requireAuth, submitAnswer); // Submit answer with time-based scoring (per-question, legacy)
+router.post("/submit-round", requireAuth, submitRound); // Batch submit all answers for a round
 
 // LB-05: Announcement routes
 router.post("/announcement", postAnnouncement); // Admin endpoint - publish announcement
@@ -46,5 +48,12 @@ router.get("/final-standings", getFinalStandings);
 router.get("/settings", getSettings);
 router.post("/settings", updateSettings);
 
+// PARTICIPATION: Participation tracking (admin)
+router.get("/participation-stats", getParticipationStatsEndpoint);
+
+// SUBMISSION: Track which teams have submitted for current round (admin)
+router.get("/submission-status", getSubmissionStatus);
+
 export default router;
+
 

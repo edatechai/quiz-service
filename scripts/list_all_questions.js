@@ -9,7 +9,7 @@ const __dirname = dirname(__filename);
 
 dotenv.config({ path: join(__dirname, "../.env") });
 
-const MONGODB_URI = process.env.MONGODB_URI || "mongodb://localhost:27017/edat-quiz";
+const MONGODB_URI = process.env.MONGO_URL || "mongodb://localhost:27017/edat-quiz";
 
 async function listAll() {
     try {

@@ -28,10 +28,15 @@ const QuizStateSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.Mixed,
         default: null,
     },
-    // All questions for the current round (pre-fetched)
     roundQuestions: {
         type: [mongoose.Schema.Types.Mixed],
         default: [],
+    },
+    // Map of round index to questions array (persisted history to ensure consistency)
+    questionsByRound: {
+        type: Map,
+        of: [mongoose.Schema.Types.Mixed],
+        default: new Map(),
     },
     // Whether quiz is active
     isActive: {
@@ -95,6 +100,7 @@ export async function getPersistedQuizState() {
             autoAdvanceEnabled: true,
             globalTimeLimitOverride: null,
             usedQuestionIds: [],
+            questionsByRound: new Map(),
         });
     }
 
@@ -129,7 +135,9 @@ export async function resetPersistedQuizState() {
             isActive: false,
             roundStarted: false,
             questionStartTime: null,
+            questionStartTime: null,
             usedQuestionIds: [],
+            questionsByRound: new Map(),
         },
         { new: true, upsert: true }
     );

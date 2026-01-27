@@ -4,6 +4,8 @@ const OptionSchema = new Schema(
 	{
 		text: { type: String, required: true, trim: true },
 		correctness: { type: Number, default: 0 },
+		score: { type: Number, default: 0 },
+		multiplier: { type: Number, default: 1 },
 	},
 	{ _id: false }
 );

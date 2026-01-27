@@ -16,6 +16,11 @@ export const quizStateStore = {
 	autoAdvanceEnabled: true, // Enable auto-advance when time runs out
 	globalTimeLimitOverride: null, // Global time limit override in seconds (null = no override, uses question's timeLimit)
 	usedQuestionIds: new Set(), // Track question IDs used across all rounds to prevent repetition
+	// Batch submission tracking
+	roundStartTime: null, // When admin started the round (for round-level countdown)
+	roundTotalDuration: 0, // Total duration for entire round (5 × questionTime) in seconds
+	roundSubmissions: new Map(), // Map<schoolId, { submittedAt, answers: [] }>
+	questionsByRound: {}, // Map of round number to questions array (persisted)
 };
 
 // Flag to track if state has been loaded from DB
@@ -25,7 +30,7 @@ let isInitialized = false;
  * Sync current in-memory state to database
  * Called after any state mutation
  */
-async function syncToDatabase() {
+export async function syncToDatabase() {
 	try {
 		await savePersistedQuizState({
 			currentRound: quizStateStore.currentRound,
@@ -39,6 +44,7 @@ async function syncToDatabase() {
 			autoAdvanceEnabled: quizStateStore.autoAdvanceEnabled,
 			globalTimeLimitOverride: quizStateStore.globalTimeLimitOverride,
 			usedQuestionIds: Array.from(quizStateStore.usedQuestionIds),
+			questionsByRound: quizStateStore.questionsByRound,
 		});
 		console.log('[QuizState] Synced to database');
 	} catch (error) {
@@ -70,6 +76,10 @@ export async function loadFromDatabase() {
 		quizStateStore.autoAdvanceEnabled = persistedState.autoAdvanceEnabled ?? true;
 		quizStateStore.globalTimeLimitOverride = persistedState.globalTimeLimitOverride ?? null;
 		quizStateStore.usedQuestionIds = new Set(persistedState.usedQuestionIds ?? []);
+		// Convert Map back to object or keep as Map if preferred, here we use object for JSON simplicity
+		quizStateStore.questionsByRound = persistedState.questionsByRound instanceof Map
+			? Object.fromEntries(persistedState.questionsByRound)
+			: (persistedState.questionsByRound || {});
 
 		isInitialized = true;
 		console.log('[QuizState] Loaded from database:', {
@@ -99,12 +109,42 @@ function getEffectiveTimeLimit(questionTimeLimit) {
 	return quizStateStore.questionDuration;
 }
 
+/**
+ * Persistently associate a set of questions with a specific round.
+ * Used to ensure all devices get the same questions for a round,
+ * even if they fetch before the round has officially started.
+ */
+export function setRoundQuestions(roundIndex, questions) {
+	if (roundIndex === null || roundIndex === undefined) return;
+
+	quizStateStore.questionsByRound = {
+		...quizStateStore.questionsByRound,
+		[roundIndex]: questions
+	};
+
+	// Also track used IDs to prevent repeats in subsequent rounds
+	questions.forEach(q => {
+		const qId = q._id?.toString() || q.id?.toString();
+		if (qId) quizStateStore.usedQuestionIds.add(qId);
+	});
+
+	// Trigger async sync to DB
+	syncToDatabase();
+}
+
 // Start a round (called by admin) - questions should be pre-fetched and passed in
 export function startRound(roundIndex, questions = []) {
 	quizStateStore.currentRound = roundIndex;
 	quizStateStore.currentQuestionIndex = 0;
 	quizStateStore.currentQuestion = questions.length > 0 ? questions[0] : null;
 	quizStateStore.roundQuestions = questions; // Store pre-fetched questions so all users get the same set
+
+	// PERSISTENCE FIX: Save questions for this round so late joiners get the same set
+	quizStateStore.questionsByRound = {
+		...quizStateStore.questionsByRound,
+		[roundIndex]: questions
+	};
+
 	quizStateStore.isActive = true;
 	quizStateStore.roundStarted = true;
 
@@ -116,6 +156,14 @@ export function startRound(roundIndex, questions = []) {
 	// START THE TIMER NOW - this is the official start time for Question 1
 	// All users will have their remaining time calculated from this moment
 	quizStateStore.questionStartTime = Date.now();
+
+	// Track round-level timing for batch submissions
+	quizStateStore.roundStartTime = Date.now();
+	const questionsInRound = roundIndex === 4 ? 1 : 5; // Sudden Death has 1 question
+	const perQuestionSeconds = quizStateStore.globalTimeLimitOverride || (quizStateStore.questionDuration / 1000) || 60;
+	quizStateStore.roundTotalDuration = questionsInRound * perQuestionSeconds;
+	quizStateStore.roundSubmissions = new Map(); // Clear submissions for new round
+	console.log(`[QuizState] Round total duration: ${quizStateStore.roundTotalDuration}s (${questionsInRound} questions × ${perQuestionSeconds}s each)`);
 
 	// Track used question IDs to prevent repetition across rounds
 	questions.forEach(q => {
@@ -136,6 +184,11 @@ export function startRound(roundIndex, questions = []) {
 // Get stored round questions (for serving to all users consistently)
 export function getRoundQuestions() {
 	return quizStateStore.roundQuestions;
+}
+
+// Get persisted questions for a specific round (history)
+export function getQuestionsForRound(roundIndex) {
+	return quizStateStore.questionsByRound[roundIndex] || null;
 }
 
 // Get used question IDs (for excluding from future rounds)
@@ -230,6 +283,12 @@ export function getCurrentQuizState() {
 		: 0;
 	const remaining = Math.max(0, quizStateStore.questionDuration - elapsed);
 
+	// Calculate round-level timing
+	const roundElapsed = quizStateStore.roundStartTime
+		? Math.floor((now - quizStateStore.roundStartTime) / 1000)
+		: 0;
+	const roundTimeRemaining = Math.max(0, quizStateStore.roundTotalDuration - roundElapsed);
+
 	return {
 		currentRound: quizStateStore.currentRound,
 		currentQuestionIndex: quizStateStore.currentQuestionIndex,
@@ -243,6 +302,11 @@ export function getCurrentQuizState() {
 		globalTimeLimitOverride: quizStateStore.globalTimeLimitOverride, // in seconds (null if not set)
 		autoAdvanced: advanceResult?.success || false,
 		roundComplete: advanceResult?.reason === 'round_complete',
+		// Batch submission tracking for admin
+		roundStartTime: quizStateStore.roundStartTime,
+		roundTotalDuration: quizStateStore.roundTotalDuration,
+		roundTimeRemaining,
+		submittedCount: quizStateStore.roundSubmissions.size,
 	};
 }
 
@@ -255,7 +319,13 @@ export async function resetQuizState() {
 	quizStateStore.isActive = false;
 	quizStateStore.roundStarted = false;
 	quizStateStore.questionStartTime = null;
+	quizStateStore.roundStartTime = null;
 	quizStateStore.usedQuestionIds = new Set(); // Clear used questions on full reset
+	quizStateStore.questionsByRound = {}; // Clear persisted history
+	// Reset batch submission tracking
+	quizStateStore.roundStartTime = null;
+	quizStateStore.roundTotalDuration = 0;
+	quizStateStore.roundSubmissions = new Map();
 
 	// Sync to database
 	try {
@@ -293,4 +363,42 @@ export function getQuestionTimingInfo() {
 		remainingSeconds: Math.floor(remaining / 1000),
 		allocatedSeconds: Math.floor(quizStateStore.questionDuration / 1000),
 	};
+}
+
+// Batch submission functions
+
+/**
+ * Record a batch submission for a school
+ */
+export function recordRoundSubmission(schoolId, answers) {
+	quizStateStore.roundSubmissions.set(schoolId, {
+		submittedAt: Date.now(),
+		answers,
+		round: quizStateStore.currentRound,
+	});
+	console.log(`[QuizState] Recorded round submission for ${schoolId} (${quizStateStore.roundSubmissions.size} total)`);
+}
+
+/**
+ * Check if a school has submitted for current round
+ */
+export function hasSubmittedRound(schoolId) {
+	return quizStateStore.roundSubmissions.has(schoolId);
+}
+
+/**
+ * Get submission for a school
+ */
+export function getRoundSubmission(schoolId) {
+	return quizStateStore.roundSubmissions.get(schoolId);
+}
+
+/**
+ * Get all round submissions (for admin)
+ */
+export function getAllRoundSubmissions() {
+	return Array.from(quizStateStore.roundSubmissions.entries()).map(([schoolId, data]) => ({
+		schoolId,
+		...data,
+	}));
 }

@@ -54,9 +54,9 @@ async function start() {
 			}
 		});
 
-		server.listen(env.port, () => {
+		server.listen(env.port, "0.0.0.0", () => {
 			// eslint-disable-next-line no-console
-			console.log(`Quiz service listening on port ${env.port}`);
+			console.log(`Quiz service listening on port ${env.port} (0.0.0.0)`);
 
 			// Start AI team polling (checks for new questions every 3 seconds)
 			const apiKey = (env.deepseekApiKey || process.env.DEEPSEEK_API_KEY || "").trim();

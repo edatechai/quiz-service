@@ -1,4 +1,5 @@
 import { Server } from "socket.io";
+import { updateSocketConnection } from "../stores/participationTracker.store.js";
 
 let io = null;
 
@@ -35,6 +36,9 @@ export function initializeSocket(server) {
 				socket.data.schoolId = schoolId;
 				socket.join(`school-${schoolId}`);
 				console.log(`[Socket] 🏫 School "${schoolId}" joined quiz room (socket: ${socket.id})`);
+
+				// Track socket connection in participation tracker
+				updateSocketConnection(schoolId, true, socket.id);
 			}
 		});
 
@@ -44,6 +48,12 @@ export function initializeSocket(server) {
 			console.log(`[Socket] ❌ Client DISCONNECTED: ${socket.id}`);
 			console.log(`[Socket] ❌ Reason: ${reason}`);
 			console.log(`[Socket] 📊 Remaining clients: ${remainingClients}`);
+
+			// Track socket disconnection in participation tracker
+			const schoolId = socket.data.schoolId;
+			if (schoolId) {
+				updateSocketConnection(schoolId, false, null);
+			}
 		});
 
 		// Handle errors
@@ -131,5 +141,11 @@ export const QUIZ_EVENTS = {
 
 	// Settings
 	SETTINGS_UPDATED: "settings:updated",
+
+	// Leaderboard/Scores
+	LEADERBOARD_UPDATED: "leaderboard:updated",
+
+	// Session management
+	FORCE_LOGOUT: "auth:force-logout",
 };
 
