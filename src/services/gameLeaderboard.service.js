@@ -543,12 +543,18 @@ export const gameLeaderboardService = {
 		// 4. Identify MVP (Rank 1)
 		const roundMVP = teamScores.length > 0 ? teamScores[0] : null;
 
-		// 5. Identify Promotions/Demotions (Top 3 / Bottom 3)
+		// 5. Identify Promotions/Demotions (Top performer / Bottom performer if few teams)
 		// Assuming "Promotions" = Improving teams or Top performers
 		// Assuming "Demotions" = Bottom teams
 		// LOGIC: Top 3 are "Promoted" (Highlighted green), Bottom 3 are "Relegated" (Highlighted red)
-		const promotions = teamScores.slice(0, 3);
-		const demotions = teamScores.length > 5 ? teamScores.slice(-3) : []; // Only show demotions if enough teams
+
+		// Dynamic thresholds for small datasets
+		const promotionCount = teamScores.length <= 4 ? 1 : 3;
+		const demotionCount = teamScores.length <= 4 ? 1 : 3;
+
+		const promotions = teamScores.slice(0, promotionCount);
+		// Only show demotions if there are at least 2 teams, and don't demote the only team
+		const demotions = (teamScores.length >= 2) ? teamScores.slice(-demotionCount) : [];
 
 		return {
 			roundIndex,
